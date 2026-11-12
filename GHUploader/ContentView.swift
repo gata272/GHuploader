@@ -1,6 +1,32 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+
+/// LiveContainer 環境でも動くよう、UIKit の UIDocumentPicker を asCopy=true で使う。
+/// （SwiftUI の fileImporter は選択状態が壊れるため使わない）
+struct DocumentPicker: UIViewControllerRepresentable {
+    var onPick: (URL) -> Void
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+        picker.delegate = context.coordinator
+        picker.allowsMultipleSelection = false
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: (URL) -> Void
+        init(onPick: @escaping (URL) -> Void) { self.onPick = onPick }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            if let url = urls.first { onPick(url) }
+        }
+    }
+}
+
 struct ContentView: View {
     @State private var token = TokenStore.load()
     @State private var repoText = "" // owner/repo
@@ -124,16 +150,14 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("GHアップローダ")
-            .fileImporter(isPresented: $showPicker, allowedContentTypes: [.item, .zip], allowsMultipleSelection: false) { result in
-                handlePick(result)
+            .sheet(isPresented: $showPicker) {
+                DocumentPicker { url in handlePickedURL(url) }
             }
         }
     }
 
-    private func handlePick(_ result: Result<[URL], Error>) {
-        guard case .success(let urls) = result, let url = urls.first else { return }
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+    private func handlePickedURL(_ url: URL) {
+        // asCopy=true でアプリ内にコピーされたファイルが渡ってくるので、そのまま読める
         do {
             rawZip = try Data(contentsOf: url)
             zipName = url.lastPathComponent
