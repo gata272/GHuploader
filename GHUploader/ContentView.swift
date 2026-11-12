@@ -124,7 +124,7 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("GHアップローダ")
-            .fileImporter(isPresented: $showPicker, allowedContentTypes: [.zip], allowsMultipleSelection: false) { result in
+            .fileImporter(isPresented: $showPicker, allowedContentTypes: [.item, .zip], allowsMultipleSelection: false) { result in
                 handlePick(result)
             }
         }
