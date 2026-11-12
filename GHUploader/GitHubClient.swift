@@ -200,3 +200,35 @@ final class ArtifactDownloader: NSObject, URLSessionDataDelegate {
         continuation = nil
     }
 }
+
+// MARK: - v3: リポジトリ一覧
+
+extension GitHubClient {
+    private func requestList(method: String, path: String) async throws -> [[String: Any]] {
+        guard let url = URL(string: "https://api.github.com" + path) else {
+            throw GHError(message: "URLが不正です")
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(code) else {
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+            let msg = json["message"] as? String ?? "不明なエラー"
+            throw GHError(message: "GitHub API エラー (\(code)): \(msg)")
+        }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] ?? []
+    }
+
+    /// トークンでアクセスできる自分のリポジトリ一覧（更新が新しい順）
+    func listMyRepos() async throws -> [(fullName: String, defaultBranch: String)] {
+        let arr = try await requestList(method: "GET", path: "/user/repos?per_page=100&sort=updated")
+        return arr.compactMap { r in
+            guard let fn = r["full_name"] as? String else { return nil }
+            return (fn, r["default_branch"] as? String ?? "main")
+        }
+    }
+}

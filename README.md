@@ -1,25 +1,19 @@
-# GHアップローダ (GHUploader)
+# GHアップローダ (GHUploader) v3
 
-ZIPをアプリ内で展開し、隠しファイル（.github など）も含めて GitHub リポジトリへ
-1コミットで直接アップロードする SwiftUI アプリ。iOS のファイル アプリを経由しないので
-ドットファイルが見えない問題が起きない。
+ZIP をアプリ内で展開（隠しファイル含む）し、GitHub API 経由で
+リポジトリ作成 → アップロード → ビルド監視 → IPA取得 までをアプリ内で完結させる。
 
-## 初回ブートストラップ
-1. このフォルダの中身のうち、見えるファイルを GitHub リポジトリにアップロード
-2. `.github/workflows/build.yml` だけは Add file > Create new file で
-   パスを手入力し、内容を README 末尾ではなく .github/workflows/build.yml と同じ内容で作成
-   （スターターZIP内のファイルと同一内容は、このリポジトリを作成したチャットに掲載済み）
-3. Actions で "Build IPA" が走り、Artifacts から GHUploader.ipa が取れる
-4. LiveContainer に Import して起動
+## v3 の改善
+- リポジトリを一覧から選択可能に（一覧取得ボタン＋ピッカー、ブランチも自動設定）
+- トークン欄に表示/非表示トグルを追加。表示中は通常の入力欄になるため
+  Simeji など全てのキーボードが使える（非表示=パスワード欄では iOS の仕様で
+  外部キーボードが無効になるため）
+- 全セクションを折りたたみ可能に（タイトルタップで開閉）
 
-## 使い方
-1. GitHub で Fine-grained Personal Access Token を発行
-   （対象リポジトリのみ、Permissions: Contents = Read and write）
-2. アプリにトークンを入力（キーチェーンに保存される）
-3. owner/repo とブランチを入力し「接続テスト」
-4. ZIPを選ぶ → 中身（隠しファイル含む）が一覧表示される
-5. 「アップロード」で1コミットとして送信される
-
-## 備考
-- トークンは端末内のキーチェーンにのみ保存され、api.github.com 以外へは送信されない
-- ZIP内の __MACOSX と .DS_Store は自動で除外される
+## 必要なトークン（Fine-grained PAT）
+- Repository access: **All repositories**
+- Permissions:
+  - **Administration: Read and write**（リポジトリ作成）
+  - **Contents: Read and write**（アップロード）
+  - **Workflows: Read and write**（.github/workflows/build.yml のアップロード）
+  - **Actions: Read-only**（ビルド状況と成果物の取得）

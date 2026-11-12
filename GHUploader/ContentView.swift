@@ -1,7 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-
 /// LiveContainer 環境でも動くよう、UIKit の UIDocumentPicker を asCopy=true で使う。
 /// （SwiftUI の fileImporter は選択状態が壊れるため使わない）
 struct DocumentPicker: UIViewControllerRepresentable {
@@ -29,6 +28,7 @@ struct DocumentPicker: UIViewControllerRepresentable {
 
 struct ContentView: View {
     @State private var token = TokenStore.load()
+    @State private var showToken = false
     @State private var repoText = "" // owner/repo
     @State private var branch = "main"
     @State private var commitMessage = "Upload via GHアップローダ"
@@ -50,6 +50,13 @@ struct ContentView: View {
     @State private var artifactList: [ArtifactInfo] = []
     @State private var ipaURL: URL? = nil
     @State private var watchTask: Task<Void, Never>? = nil
+    // v3
+    @State private var myRepos: [(fullName: String, defaultBranch: String)] = []
+    @State private var settingsExpanded = TokenStore.load().isEmpty
+    @State private var createExpanded = false
+    @State private var zipExpanded = true
+    @State private var uploadExpanded = true
+    @State private var buildExpanded = true
 
     private var parsedRepo: (owner: String, repo: String)? {
         let parts = repoText.split(separator: "/")
@@ -57,88 +64,153 @@ struct ContentView: View {
         return (String(parts[0]), String(parts[1]))
     }
 
+    private func sectionHeader(_ title: String, _ expanded: Binding<Bool>) -> some View {
+        Button {
+            withAnimation { expanded.wrappedValue.toggle() }
+        } label: {
+            HStack {
+                Text(title)
+                Spacer()
+                Image(systemName: expanded.wrappedValue ? "chevron.down" : "chevron.right")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
-                Section("GitHub設定") {
-                    SecureField("Personal Access Token", text: $token)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+                Section {
+                    if settingsExpanded {
+                        HStack {
+                            if showToken {
+                                TextField("Personal Access Token", text: $token)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                            } else {
+                                SecureField("Personal Access Token", text: $token)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                            }
+                            Button {
+                                showToken.toggle()
+                            } label: {
+                                Image(systemName: showToken ? "eye.slash" : "eye")
+                            }
+                            .buttonStyle(.borderless)
+                        }
                         .onChange(of: token) { _, new in TokenStore.save(new) }
-                    TextField("owner/repo（例: username/toolkit）", text: $repoText)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    HStack {
-                        Text("ブランチ")
-                        Spacer()
-                        TextField("main", text: $branch)
-                            .multilineTextAlignment(.trailing)
+                        Text("目のアイコンで表示に切り替えると、Simejiなど全てのキーボードが使えます（パスワード欄ではiOSの仕様で外部キーボードが無効になります）")
+                            .font(.caption).foregroundStyle(.secondary)
+                        TextField("owner/repo（例: username/toolkit）", text: $repoText)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
+                            .onChange(of: repoText) { _, new in
+                                if let r = myRepos.first(where: { $0.fullName == new }) {
+                                    branch = r.defaultBranch
+                                }
+                            }
+                        Button("リポジトリ一覧を取得") { Task { await loadRepos() } }
+                            .disabled(token.isEmpty || isBusy)
+                        if !myRepos.isEmpty {
+                            Picker("リポジトリを選択", selection: $repoText) {
+                                Text("（未選択）").tag("")
+                                ForEach(myRepos, id: \.fullName) { r in
+                                    Text(r.fullName).tag(r.fullName)
+                                }
+                            }
+                        }
+                        HStack {
+                            Text("ブランチ")
+                            Spacer()
+                            TextField("main", text: $branch)
+                                .multilineTextAlignment(.trailing)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                        }
+                        Button("接続テスト") { Task { await testConnection() } }
+                            .disabled(token.isEmpty || isBusy)
                     }
-                    Button("接続テスト") { Task { await testConnection() } }
-                        .disabled(token.isEmpty || isBusy)
+                } header: {
+                    sectionHeader("GitHub設定", $settingsExpanded)
                 }
 
-                Section("新規リポジトリ") {
-                    TextField("リポジトリ名（例: toolkit）", text: $newRepoName)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    Toggle("Privateにする", isOn: $newRepoPrivate)
-                    Button("この名前でリポジトリを作成") { Task { await createRepo() } }
-                        .disabled(token.isEmpty || newRepoName.isEmpty || isBusy)
-                    Text("作成にはトークンの Administration 権限が必要です").font(.caption).foregroundStyle(.secondary)
+                Section {
+                    if createExpanded {
+                        TextField("リポジトリ名（例: toolkit）", text: $newRepoName)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Toggle("Privateにする", isOn: $newRepoPrivate)
+                        Button("この名前でリポジトリを作成") { Task { await createRepo() } }
+                            .disabled(token.isEmpty || newRepoName.isEmpty || isBusy)
+                        Text("作成にはトークンの Administration 権限が必要です").font(.caption).foregroundStyle(.secondary)
+                    }
+                } header: {
+                    sectionHeader("新規リポジトリ", $createExpanded)
                 }
 
-                Section("ZIPファイル") {
-                    Button("ZIPを選ぶ") { showPicker = true }
-                    if !zipName.isEmpty {
-                        Text(zipName).font(.footnote).foregroundStyle(.secondary)
-                        Toggle("最上位フォルダを取り除く", isOn: $stripTopFolder)
-                            .onChange(of: stripTopFolder) { _, _ in reExtract() }
-                        Text("\(files.count) ファイル（隠しファイル含む）")
-                    }
-                    if !files.isEmpty {
-                        ForEach(files.prefix(30), id: \.path) { f in
-                            Text(f.path).font(.caption).lineLimit(1)
+                Section {
+                    if zipExpanded {
+                        Button("ZIPを選ぶ") { showPicker = true }
+                        if !zipName.isEmpty {
+                            Text(zipName).font(.footnote).foregroundStyle(.secondary)
+                            Toggle("最上位フォルダを取り除く", isOn: $stripTopFolder)
+                                .onChange(of: stripTopFolder) { _, _ in reExtract() }
+                            Text("\(files.count) ファイル（隠しファイル含む）")
                         }
-                        if files.count > 30 {
-                            Text("…ほか \(files.count - 30) 件").font(.caption).foregroundStyle(.secondary)
+                        if !files.isEmpty {
+                            ForEach(files.prefix(30), id: \.path) { f in
+                                Text(f.path).font(.caption).lineLimit(1)
+                            }
+                            if files.count > 30 {
+                                Text("…ほか \(files.count - 30) 件").font(.caption).foregroundStyle(.secondary)
+                            }
                         }
                     }
+                } header: {
+                    sectionHeader("ZIPファイル", $zipExpanded)
                 }
 
-                Section("アップロード") {
-                    TextField("コミットメッセージ", text: $commitMessage)
-                    Button(isBusy ? "送信中…" : "アップロード") {
-                        Task { await upload() }
+                Section {
+                    if uploadExpanded {
+                        TextField("コミットメッセージ", text: $commitMessage)
+                        Button(isBusy ? "送信中…" : "アップロード") {
+                            Task { await upload() }
+                        }
+                        .disabled(isBusy || files.isEmpty || token.isEmpty || repoText.isEmpty)
+                        if !progressText.isEmpty {
+                            Text(progressText).font(.footnote).foregroundStyle(.secondary)
+                        }
                     }
-                    .disabled(isBusy || files.isEmpty || token.isEmpty || repoText.isEmpty)
-                    if !progressText.isEmpty {
-                        Text(progressText).font(.footnote).foregroundStyle(.secondary)
-                    }
+                } header: {
+                    sectionHeader("アップロード", $uploadExpanded)
                 }
 
-                Section("ビルドとIPA") {
-                    Button("ビルド状況を確認") { startWatch() }
-                        .disabled(token.isEmpty || parsedRepo == nil || isBusy)
-                    if !runStatus.isEmpty {
-                        Text(runStatus).font(.footnote).foregroundStyle(runFailed ? .red : .primary)
-                    }
-                    if !runURL.isEmpty, let u = URL(string: runURL) {
-                        Link("GitHubで開く", destination: u)
-                    }
-                    ForEach(artifactList) { a in
-                        Button("\(a.name) を取得（\(max(a.size / 1024, 1)) KB）") {
-                            Task { await fetchArtifact(a) }
+                Section {
+                    if buildExpanded {
+                        Button("ビルド状況を確認") { startWatch() }
+                            .disabled(token.isEmpty || parsedRepo == nil || isBusy)
+                        if !runStatus.isEmpty {
+                            Text(runStatus).font(.footnote).foregroundStyle(runFailed ? .red : .primary)
                         }
-                        .disabled(isBusy)
-                    }
-                    if let ipaURL {
-                        ShareLink(item: ipaURL) {
-                            Text("IPAを共有（LiveContainerへ送る）")
+                        if !runURL.isEmpty, let u = URL(string: runURL) {
+                            Link("GitHubで開く", destination: u)
+                        }
+                        ForEach(artifactList) { a in
+                            Button("\(a.name) を取得（\(max(a.size / 1024, 1)) KB）") {
+                                Task { await fetchArtifact(a) }
+                            }
+                            .disabled(isBusy)
+                        }
+                        if let ipaURL {
+                            ShareLink(item: ipaURL) {
+                                Text("IPAを共有（LiveContainerへ送る）")
+                            }
                         }
                     }
+                } header: {
+                    sectionHeader("ビルドとIPA", $buildExpanded)
                 }
 
                 if !status.isEmpty {
@@ -188,6 +260,24 @@ struct ContentView: View {
             let login = try await GitHubClient(token: token).currentUser()
             status = "接続OK：\(login) として認証されました"
             isError = false
+        } catch {
+            status = error.localizedDescription
+            isError = true
+        }
+    }
+
+    private func loadRepos() async {
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            myRepos = try await GitHubClient(token: token).listMyRepos()
+            if myRepos.isEmpty {
+                status = "取得できるリポジトリがありませんでした（トークンの対象範囲を確認してください）"
+                isError = true
+            } else {
+                status = "\(myRepos.count) 件のリポジトリを取得しました"
+                isError = false
+            }
         } catch {
             status = error.localizedDescription
             isError = true
