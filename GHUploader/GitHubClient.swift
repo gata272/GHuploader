@@ -97,3 +97,106 @@ struct GitHubClient {
         return String(commitSha.prefix(7))
     }
 }
+
+// MARK: - v2: リポジトリ作成 / Actions / 成果物
+
+struct RunInfo {
+    let id: Int
+    let status: String        // queued / in_progress / completed
+    let conclusion: String?   // success / failure / cancelled ...
+    let htmlURL: String
+}
+
+struct ArtifactInfo: Identifiable {
+    let id: Int
+    let name: String
+    let size: Int
+}
+
+extension GitHubClient {
+    /// POST /user/repos で自分のアカウントにリポジトリを作成する
+    func createRepository(name: String, isPrivate: Bool) async throws -> (fullName: String, defaultBranch: String) {
+        let json = try await request(method: "POST", path: "/user/repos", body: [
+            "name": name,
+            "private": isPrivate,
+            "auto_init": false,
+        ])
+        return (json["full_name"] as? String ?? name,
+                json["default_branch"] as? String ?? "main")
+    }
+
+    func latestRun(owner: String, repo: String, branch: String) async throws -> RunInfo? {
+        let b = branch.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? branch
+        let json = try await request(method: "GET", path: "/repos/\(owner)/\(repo)/actions/runs?branch=\(b)&per_page=1")
+        guard let runs = json["workflow_runs"] as? [[String: Any]], let r = runs.first else { return nil }
+        return RunInfo(id: r["id"] as? Int ?? 0,
+                       status: r["status"] as? String ?? "",
+                       conclusion: r["conclusion"] as? String,
+                       htmlURL: r["html_url"] as? String ?? "")
+    }
+
+    func listArtifacts(owner: String, repo: String, runId: Int) async throws -> [ArtifactInfo] {
+        let json = try await request(method: "GET", path: "/repos/\(owner)/\(repo)/actions/runs/\(runId)/artifacts")
+        let arr = json["artifacts"] as? [[String: Any]] ?? []
+        return arr.map { ArtifactInfo(id: $0["id"] as? Int ?? 0,
+                                      name: $0["name"] as? String ?? "artifact",
+                                      size: $0["size_in_bytes"] as? Int ?? 0) }
+    }
+
+    func downloadArtifact(owner: String, repo: String, artifactId: Int) async throws -> Data {
+        guard let url = URL(string: "https://api.github.com/repos/\(owner)/\(repo)/actions/artifacts/\(artifactId)/zip") else {
+            throw GHError(message: "URLが不正です")
+        }
+        return try await ArtifactDownloader.download(url: url, token: token)
+    }
+}
+
+/// 成果物ZIPのダウンロード用。リダイレクト先（署名付きURL）には認証ヘッダを付けない。
+final class ArtifactDownloader: NSObject, URLSessionDataDelegate {
+    private var buffer = Data()
+    private var continuation: CheckedContinuation<Data, Error>?
+    private var statusCode = 0
+
+    static func download(url: URL, token: String) async throws -> Data {
+        let d = ArtifactDownloader()
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        return try await withCheckedThrowingContinuation { cont in
+            d.continuation = cont
+            let session = URLSession(configuration: .default, delegate: d, delegateQueue: nil)
+            session.dataTask(with: req).resume()
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        var r = request
+        r.setValue(nil, forHTTPHeaderField: "Authorization")
+        completionHandler(r)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                    didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        buffer.append(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            continuation?.resume(throwing: error)
+        } else if statusCode == 200 {
+            continuation?.resume(returning: buffer)
+        } else {
+            continuation?.resume(throwing: GHError(message: "成果物の取得に失敗しました (HTTP \(statusCode))"))
+        }
+        continuation = nil
+    }
+}

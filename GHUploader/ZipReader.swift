@@ -24,3 +24,19 @@ enum ZipReader {
         return files.filter { !$0.path.isEmpty }
     }
 }
+
+extension ZipReader {
+    /// 成果物ZIPの中から最初の .ipa を取り出して一時フォルダに書き出す
+    static func extractFirstIPA(data: Data) throws -> URL {
+        let archive = try Archive(data: data, accessMode: .read)
+        for entry in archive where entry.type == .file && entry.path.lowercased().hasSuffix(".ipa") {
+            var d = Data()
+            _ = try archive.extract(entry) { chunk in d.append(chunk) }
+            let name = entry.path.split(separator: "/").last.map(String.init) ?? "app.ipa"
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+            try d.write(to: url, options: .atomic)
+            return url
+        }
+        throw GHError(message: "成果物の中にIPAが見つかりませんでした")
+    }
+}
