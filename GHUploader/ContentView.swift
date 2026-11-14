@@ -51,6 +51,9 @@ struct ContentView: View {
     @State private var artifactList: [ArtifactInfo] = []
     @State private var artifactRunId: Int? = nil
     @State private var ipaURL: URL? = nil
+    @State private var selectedRunId: Int? = nil
+    @State private var downloadProgress: Double? = nil
+    @State private var keptIPA: URL? = nil
     @State private var watchTask: Task<Void, Never>? = nil
     @State private var lastUploadRepo = UserDefaults.standard.string(forKey: "gh.lastUploadRepo") ?? ""
     @State private var lastUploadSha = UserDefaults.standard.string(forKey: "gh.lastUploadSha") ?? ""
@@ -104,6 +107,9 @@ struct ContentView: View {
             buildTab
                 .tabItem { Label("ビルド", systemImage: "hammer") }
                 .tag(1)
+        }
+        .task {
+            if keptIPA == nil { keptIPA = ZipReader.storedIPAs().first }
         }
     }
 
@@ -310,8 +316,13 @@ struct ContentView: View {
                             Text("今回のアップロード")
                         }
 
-                        if !artifactList.isEmpty {
+                        if artifactRunId != nil {
                             Section("成果物") {
+                                if artifactList.isEmpty {
+                                    Text("このビルドに成果物はありません")
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
                                 ForEach(artifactList) { a in
                                     Button {
                                         Task { await fetchArtifact(a) }
@@ -320,25 +331,37 @@ struct ContentView: View {
                                     }
                                     .disabled(isBusy)
                                 }
-                                if let ipaURL {
-                                    ShareLink(item: ipaURL) {
-                                        Label("IPAを共有（LiveContainerへ送る）", systemImage: "square.and.arrow.up")
+                                if let downloadProgress {
+                                    ProgressView(value: downloadProgress) {
+                                        Text("ダウンロード中… \(Int(downloadProgress * 100))%")
+                                            .font(.caption)
+                                    }
+                                }
+                                if let shareIPA {
+                                    ShareLink(item: shareIPA) {
+                                        Label("IPAを共有（\(shareIPA.lastPathComponent)）", systemImage: "square.and.arrow.up")
+                                    }
+                                    Button(role: .destructive) {
+                                        deleteKeptIPA()
+                                    } label: {
+                                        Label("保存済みIPAを削除", systemImage: "trash")
                                     }
                                 }
                             }
                         }
 
-                        Section("最近のビルド（タップでGitHubを開く）") {
+                        Section("最近のビルド（タップで成果物を表示）") {
                             if runs.isEmpty {
                                 Text("まだ取得していません。「ビルド状況を確認」を押してください")
                                     .font(.footnote)
                                     .foregroundStyle(.secondary)
                             }
                             ForEach(runs) { run in
-                                Button {
-                                    if let u = URL(string: run.htmlURL) { openURL(u) }
-                                } label: {
-                                    HStack(spacing: 10) {
+                                HStack(spacing: 10) {
+                                    Button {
+                                        selectRun(run)
+                                    } label: {
+                                        HStack(spacing: 10) {
                                         Image(systemName: runIcon(run).name)
                                             .foregroundStyle(runIcon(run).color)
                                             .font(.title3)
@@ -361,12 +384,20 @@ struct ContentView: View {
                                                 .foregroundStyle(.secondary)
                                         }
                                         Spacer()
-                                        Image(systemName: "chevron.right")
-                                            .font(.caption)
-                                            .foregroundStyle(.tertiary)
+                                        if selectedRunId == run.id {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .foregroundStyle(Color.accentColor)
+                                        }
                                     }
+                                    }
+                                    .buttonStyle(.plain)
+                                    Button {
+                                        if let u = URL(string: run.htmlURL) { openURL(u) }
+                                    } label: {
+                                        Image(systemName: "safari")
+                                    }
+                                    .buttonStyle(.borderless)
                                 }
-                                .buttonStyle(.plain)
                             }
                         }
                     }
@@ -418,6 +449,14 @@ struct ContentView: View {
         case "cancelled": return "キャンセル"
         default: return run.conclusion ?? "終了"
         }
+    }
+
+    private var shareIPA: URL? { ipaURL ?? keptIPA }
+
+    private func deleteKeptIPA() {
+        if let shareIPA { try? FileManager.default.removeItem(at: shareIPA) }
+        ipaURL = nil
+        keptIPA = nil
     }
 
     // MARK: - ZIP
@@ -524,6 +563,7 @@ struct ContentView: View {
             runs = []
             artifactList = []
             artifactRunId = nil
+            selectedRunId = nil
             ipaURL = nil
             status = "完了！コミット \(sha) で \(files.count) ファイルをアップロードしました。「ビルド」タブで今回のビルドを監視します"
             isError = false
@@ -559,9 +599,8 @@ struct ContentView: View {
                             watchStatus = "今回のビルドが成功しました（\(relativeTime(m.createdAt))開始）"
                             watchFailed = false
                             if artifactRunId != m.id {
-                                artifactList = (try? await client.listArtifacts(owner: target.owner, repo: target.repo, runId: m.id)) ?? []
-                                artifactRunId = m.id
-                                if artifactList.isEmpty { watchStatus = "今回のビルドは成功しましたが、成果物がありません" }
+                                selectedRunId = m.id
+                                await loadArtifacts(for: m.id)
                             }
                         } else {
                             watchStatus = "今回のビルドは終了しました: \(runConclusionText(m))"
@@ -576,8 +615,8 @@ struct ContentView: View {
                     if latest.status == "completed" {
                         watchStatus = "最新のビルドは\(runConclusionText(latest))です（\(relativeTime(latest.createdAt))開始・今回のアップロードではありません）"
                         if latest.conclusion == "success", artifactRunId != latest.id {
-                            artifactList = (try? await client.listArtifacts(owner: target.owner, repo: target.repo, runId: latest.id)) ?? []
-                            artifactRunId = latest.id
+                            selectedRunId = latest.id
+                            await loadArtifacts(for: latest.id)
                         }
                         return
                     }
@@ -596,16 +635,58 @@ struct ContentView: View {
         watchStatus = "監視を終了しました（まだ終わっていない場合は、もう一度確認してください）"
     }
 
+    private func selectRun(_ run: RunInfo) {
+        selectedRunId = run.id
+        ipaURL = nil
+        if run.status != "completed" {
+            watchStatus = "このビルドはまだ完了していません（\(run.status)）"
+            watchFailed = false
+            artifactList = []
+            artifactRunId = run.id
+        } else if run.conclusion != "success" {
+            watchStatus = "このビルドは成功していないため、成果物はありません"
+            watchFailed = true
+            artifactList = []
+            artifactRunId = run.id
+        } else {
+            Task { await loadArtifacts(for: run.id) }
+        }
+    }
+
+    private func loadArtifacts(for runId: Int) async {
+        guard let target = parsedRepo else { return }
+        artifactRunId = runId
+        do {
+            artifactList = try await GitHubClient(token: token).listArtifacts(owner: target.owner, repo: target.repo, runId: runId)
+            if artifactList.isEmpty {
+                watchStatus = "このビルドに成果物はありません"
+                watchFailed = false
+            }
+        } catch {
+            watchStatus = "成果物一覧の取得に失敗: \(error.localizedDescription)"
+            watchFailed = true
+        }
+    }
+
     private func fetchArtifact(_ a: ArtifactInfo) async {
         guard let target = parsedRepo else { return }
         isBusy = true
-        defer { isBusy = false }
+        downloadProgress = 0
+        defer { isBusy = false; downloadProgress = nil }
         do {
-            let data = try await GitHubClient(token: token).downloadArtifact(owner: target.owner, repo: target.repo, artifactId: a.id)
-            ipaURL = try ZipReader.extractFirstIPA(data: data)
+            let data = try await GitHubClient(token: token).downloadArtifact(owner: target.owner, repo: target.repo, artifactId: a.id) { p in
+                Task { @MainActor in downloadProgress = p }
+            }
+            let url = try ZipReader.extractFirstIPA(data: data)
+            ipaURL = url
+            keptIPA = url
+            watchStatus = "IPAを取得しました: \(url.lastPathComponent)（アプリ内に保存済み）"
+            watchFailed = false
             status = "IPAを取得しました。「IPAを共有」からLiveContainerへ送ってください"
             isError = false
         } catch {
+            watchStatus = "IPAの取得に失敗: \(error.localizedDescription)"
+            watchFailed = true
             status = error.localizedDescription
             isError = true
         }

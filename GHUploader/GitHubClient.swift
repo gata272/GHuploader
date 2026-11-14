@@ -58,6 +58,27 @@ struct GitHubClient {
             }
         }
 
+        // 空のリポジトリは Git Data API で最初の ref を作れない（409になる）ため、
+        // Contents API で README の初期コミットを作ってから通常フローに合流する
+        if parentCommit == nil {
+            let readme = "# \(repo)\n\nCreated with GHアップローダ\n"
+            _ = try await request(method: "PUT", path: "\(base)/contents/README.md", body: [
+                "message": "Initial commit",
+                "content": Data(readme.utf8).base64EncodedString(),
+                "branch": branch,
+            ])
+            if let ref = try? await request(method: "GET", path: "\(base)/git/ref/heads/\(encodedBranch)"),
+               let object = ref["object"] as? [String: Any],
+               let sha = object["sha"] as? String {
+                parentCommit = sha
+                if let commit = try? await request(method: "GET", path: "\(base)/git/commits/\(sha)"),
+                   let tree = commit["tree"] as? [String: Any],
+                   let treeSha = tree["sha"] as? String {
+                    baseTree = treeSha
+                }
+            }
+        }
+
         // 各ファイルを blob 化
         var treeItems: [[String: Any]] = []
         for (i, file) in files.enumerated() {
@@ -122,7 +143,7 @@ extension GitHubClient {
         let json = try await request(method: "POST", path: "/user/repos", body: [
             "name": name,
             "private": isPrivate,
-            "auto_init": false,
+            "auto_init": true,
         ])
         return (json["full_name"] as? String ?? name,
                 json["default_branch"] as? String ?? "main")
@@ -158,11 +179,12 @@ extension GitHubClient {
                                       size: $0["size_in_bytes"] as? Int ?? 0) }
     }
 
-    func downloadArtifact(owner: String, repo: String, artifactId: Int) async throws -> Data {
+    func downloadArtifact(owner: String, repo: String, artifactId: Int,
+                          progress: ((Double) -> Void)? = nil) async throws -> Data {
         guard let url = URL(string: "https://api.github.com/repos/\(owner)/\(repo)/actions/artifacts/\(artifactId)/zip") else {
             throw GHError(message: "URLが不正です")
         }
-        return try await ArtifactDownloader.download(url: url, token: token)
+        return try await ArtifactDownloader.download(url: url, token: token, progress: progress)
     }
 }
 
@@ -171,9 +193,12 @@ final class ArtifactDownloader: NSObject, URLSessionDataDelegate {
     private var buffer = Data()
     private var continuation: CheckedContinuation<Data, Error>?
     private var statusCode = 0
+    private var expectedLength: Int64 = -1
+    private var onProgress: ((Double) -> Void)?
 
-    static func download(url: URL, token: String) async throws -> Data {
+    static func download(url: URL, token: String, progress: ((Double) -> Void)? = nil) async throws -> Data {
         let d = ArtifactDownloader()
+        d.onProgress = progress
         var req = URLRequest(url: url)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -197,11 +222,15 @@ final class ArtifactDownloader: NSObject, URLSessionDataDelegate {
                     didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        expectedLength = response.expectedContentLength
         completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         buffer.append(data)
+        if expectedLength > 0 {
+            onProgress?(Double(buffer.count) / Double(expectedLength))
+        }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -213,6 +242,7 @@ final class ArtifactDownloader: NSObject, URLSessionDataDelegate {
             continuation?.resume(throwing: GHError(message: "成果物の取得に失敗しました (HTTP \(statusCode))"))
         }
         continuation = nil
+        session.finishTasksAndInvalidate()
     }
 }
 
