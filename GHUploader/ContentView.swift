@@ -27,6 +27,7 @@ struct DocumentPicker: UIViewControllerRepresentable {
 }
 
 struct ContentView: View {
+    @State private var selectedTab = 0
     @State private var token = TokenStore.load()
     @State private var showToken = false
     @State private var repoText = "" // owner/repo
@@ -41,27 +42,42 @@ struct ContentView: View {
     @State private var isError = false
     @State private var isBusy = false
     @State private var progressText = ""
-    // v2
     @State private var newRepoName = ""
     @State private var newRepoPrivate = false
-    @State private var runStatus = ""
-    @State private var runFailed = false
-    @State private var runURL = ""
+    // ビルド監視（v4: 「今回のコミット」の実行だけを結果として扱う）
+    @State private var runs: [RunInfo] = []
+    @State private var watchStatus = ""
+    @State private var watchFailed = false
     @State private var artifactList: [ArtifactInfo] = []
+    @State private var artifactRunId: Int? = nil
     @State private var ipaURL: URL? = nil
     @State private var watchTask: Task<Void, Never>? = nil
-    // v3
+    @State private var lastUploadRepo = UserDefaults.standard.string(forKey: "gh.lastUploadRepo") ?? ""
+    @State private var lastUploadSha = UserDefaults.standard.string(forKey: "gh.lastUploadSha") ?? ""
+    @State private var lastUploadAt = UserDefaults.standard.object(forKey: "gh.lastUploadAt") as? Date
+    // リポジトリ一覧・折りたたみ
     @State private var myRepos: [(fullName: String, defaultBranch: String)] = []
     @State private var settingsExpanded = TokenStore.load().isEmpty
     @State private var createExpanded = false
     @State private var zipExpanded = true
     @State private var uploadExpanded = true
-    @State private var buildExpanded = true
+
+    @Environment(\.openURL) private var openURL
 
     private var parsedRepo: (owner: String, repo: String)? {
         let parts = repoText.split(separator: "/")
         guard parts.count == 2 else { return nil }
         return (String(parts[0]), String(parts[1]))
+    }
+
+    /// 今回アップロードしたコミットに対する実行（前回の実行と取り違えないための照合）
+    private var matchedRun: RunInfo? {
+        guard !lastUploadSha.isEmpty, lastUploadRepo == repoText else { return nil }
+        return runs.first { $0.headSha.hasPrefix(lastUploadSha) }
+    }
+
+    private var hasUploadContext: Bool {
+        !lastUploadSha.isEmpty && lastUploadRepo == repoText
     }
 
     private func sectionHeader(_ title: String, _ expanded: Binding<Bool>) -> some View {
@@ -71,14 +87,29 @@ struct ContentView: View {
             HStack {
                 Text(title)
                 Spacer()
-                Image(systemName: expanded.wrappedValue ? "chevron.down" : "chevron.right")
-                    .font(.caption2)
+                Image(systemName: "chevron.down")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(expanded.wrappedValue ? 0 : -90))
             }
         }
+        .buttonStyle(.plain)
     }
 
     var body: some View {
+        TabView(selection: $selectedTab) {
+            uploadTab
+                .tabItem { Label("アップロード", systemImage: "square.and.arrow.up") }
+                .tag(0)
+            buildTab
+                .tabItem { Label("ビルド", systemImage: "hammer") }
+                .tag(1)
+        }
+    }
+
+    // MARK: - アップロードタブ
+
+    private var uploadTab: some View {
         NavigationStack {
             Form {
                 Section {
@@ -111,8 +142,12 @@ struct ContentView: View {
                                     branch = r.defaultBranch
                                 }
                             }
-                        Button("リポジトリ一覧を取得") { Task { await loadRepos() } }
-                            .disabled(token.isEmpty || isBusy)
+                        Button {
+                            Task { await loadRepos() }
+                        } label: {
+                            Label("リポジトリ一覧を取得", systemImage: "list.bullet")
+                        }
+                        .disabled(token.isEmpty || isBusy)
                         if !myRepos.isEmpty {
                             Picker("リポジトリを選択", selection: $repoText) {
                                 Text("（未選択）").tag("")
@@ -121,16 +156,18 @@ struct ContentView: View {
                                 }
                             }
                         }
-                        HStack {
-                            Text("ブランチ")
-                            Spacer()
+                        LabeledContent("ブランチ") {
                             TextField("main", text: $branch)
                                 .multilineTextAlignment(.trailing)
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                         }
-                        Button("接続テスト") { Task { await testConnection() } }
-                            .disabled(token.isEmpty || isBusy)
+                        Button {
+                            Task { await testConnection() }
+                        } label: {
+                            Label("接続テスト", systemImage: "checkmark.circle")
+                        }
+                        .disabled(token.isEmpty || isBusy)
                     }
                 } header: {
                     sectionHeader("GitHub設定", $settingsExpanded)
@@ -142,8 +179,14 @@ struct ContentView: View {
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                         Toggle("Privateにする", isOn: $newRepoPrivate)
-                        Button("この名前でリポジトリを作成") { Task { await createRepo() } }
-                            .disabled(token.isEmpty || newRepoName.isEmpty || isBusy)
+                        Button {
+                            Task { await createRepo() }
+                        } label: {
+                            Label("この名前でリポジトリを作成", systemImage: "plus.circle")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(token.isEmpty || newRepoName.isEmpty || isBusy)
                         Text("作成にはトークンの Administration 権限が必要です").font(.caption).foregroundStyle(.secondary)
                     }
                 } header: {
@@ -152,12 +195,18 @@ struct ContentView: View {
 
                 Section {
                     if zipExpanded {
-                        Button("ZIPを選ぶ") { showPicker = true }
+                        Button {
+                            showPicker = true
+                        } label: {
+                            Label("ZIPを選ぶ", systemImage: "doc.zipper")
+                        }
                         if !zipName.isEmpty {
-                            Text(zipName).font(.footnote).foregroundStyle(.secondary)
+                            LabeledContent("選択中", value: zipName)
+                                .font(.footnote)
                             Toggle("最上位フォルダを取り除く", isOn: $stripTopFolder)
                                 .onChange(of: stripTopFolder) { _, _ in reExtract() }
-                            Text("\(files.count) ファイル（隠しファイル含む）")
+                            LabeledContent("ファイル数", value: "\(files.count)（隠しファイル含む）")
+                                .font(.footnote)
                         }
                         if !files.isEmpty {
                             ForEach(files.prefix(30), id: \.path) { f in
@@ -175,9 +224,13 @@ struct ContentView: View {
                 Section {
                     if uploadExpanded {
                         TextField("コミットメッセージ", text: $commitMessage)
-                        Button(isBusy ? "送信中…" : "アップロード") {
+                        Button {
                             Task { await upload() }
+                        } label: {
+                            Label(isBusy ? "送信中…" : "アップロード", systemImage: "arrow.up.circle")
+                                .frame(maxWidth: .infinity)
                         }
+                        .buttonStyle(.borderedProminent)
                         .disabled(isBusy || files.isEmpty || token.isEmpty || repoText.isEmpty)
                         if !progressText.isEmpty {
                             Text(progressText).font(.footnote).foregroundStyle(.secondary)
@@ -185,32 +238,6 @@ struct ContentView: View {
                     }
                 } header: {
                     sectionHeader("アップロード", $uploadExpanded)
-                }
-
-                Section {
-                    if buildExpanded {
-                        Button("ビルド状況を確認") { startWatch() }
-                            .disabled(token.isEmpty || parsedRepo == nil || isBusy)
-                        if !runStatus.isEmpty {
-                            Text(runStatus).font(.footnote).foregroundStyle(runFailed ? .red : .primary)
-                        }
-                        if !runURL.isEmpty, let u = URL(string: runURL) {
-                            Link("GitHubで開く", destination: u)
-                        }
-                        ForEach(artifactList) { a in
-                            Button("\(a.name) を取得（\(max(a.size / 1024, 1)) KB）") {
-                                Task { await fetchArtifact(a) }
-                            }
-                            .disabled(isBusy)
-                        }
-                        if let ipaURL {
-                            ShareLink(item: ipaURL) {
-                                Text("IPAを共有（LiveContainerへ送る）")
-                            }
-                        }
-                    }
-                } header: {
-                    sectionHeader("ビルドとIPA", $buildExpanded)
                 }
 
                 if !status.isEmpty {
@@ -227,6 +254,173 @@ struct ContentView: View {
             }
         }
     }
+
+    // MARK: - ビルドタブ
+
+    private var buildTab: some View {
+        NavigationStack {
+            Group {
+                if parsedRepo == nil {
+                    ContentUnavailableView {
+                        Label("リポジトリが未選択です", systemImage: "hammer")
+                    } description: {
+                        Text("「アップロード」タブのGitHub設定でリポジトリを選ぶと、ビルド状況がここに表示されます。")
+                    }
+                } else {
+                    List {
+                        Section {
+                            if hasUploadContext {
+                                LabeledContent("コミット", value: String(lastUploadSha.prefix(7)))
+                                    .font(.subheadline)
+                                if let lastUploadAt {
+                                    LabeledContent("アップロード", value: relativeTime(lastUploadAt))
+                                        .font(.subheadline)
+                                }
+                                if let m = matchedRun {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: runIcon(m).name)
+                                            .foregroundStyle(runIcon(m).color)
+                                        Text("今回のビルド: \(runConclusionText(m))")
+                                            .font(.subheadline.weight(.semibold))
+                                    }
+                                } else {
+                                    Label("今回のコミットのビルドはまだ開始されていません。前回のビルド結果は今回の結果ではありません。", systemImage: "exclamationmark.triangle")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.orange)
+                                }
+                            } else {
+                                Text("このリポジトリへの直近のアップロード記録はありません。下の一覧は過去のビルドです。")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Button {
+                                startWatch()
+                            } label: {
+                                Label("ビルド状況を確認（自動更新）", systemImage: "arrow.clockwise")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(token.isEmpty || isBusy)
+                            if !watchStatus.isEmpty {
+                                Text(watchStatus)
+                                    .font(.footnote)
+                                    .foregroundStyle(watchFailed ? .red : .primary)
+                            }
+                        } header: {
+                            Text("今回のアップロード")
+                        }
+
+                        if !artifactList.isEmpty {
+                            Section("成果物") {
+                                ForEach(artifactList) { a in
+                                    Button {
+                                        Task { await fetchArtifact(a) }
+                                    } label: {
+                                        Label("\(a.name) を取得（\(max(a.size / 1024, 1)) KB）", systemImage: "arrow.down.circle")
+                                    }
+                                    .disabled(isBusy)
+                                }
+                                if let ipaURL {
+                                    ShareLink(item: ipaURL) {
+                                        Label("IPAを共有（LiveContainerへ送る）", systemImage: "square.and.arrow.up")
+                                    }
+                                }
+                            }
+                        }
+
+                        Section("最近のビルド（タップでGitHubを開く）") {
+                            if runs.isEmpty {
+                                Text("まだ取得していません。「ビルド状況を確認」を押してください")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+                            ForEach(runs) { run in
+                                Button {
+                                    if let u = URL(string: run.htmlURL) { openURL(u) }
+                                } label: {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: runIcon(run).name)
+                                            .foregroundStyle(runIcon(run).color)
+                                            .font(.title3)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            HStack(spacing: 6) {
+                                                Text(runConclusionText(run))
+                                                    .font(.subheadline.weight(.semibold))
+                                                    .foregroundStyle(.primary)
+                                                if hasUploadContext, run.headSha.hasPrefix(lastUploadSha) {
+                                                    Text("今回")
+                                                        .font(.caption2.weight(.bold))
+                                                        .padding(.horizontal, 6)
+                                                        .padding(.vertical, 2)
+                                                        .background(Color.accentColor.opacity(0.2))
+                                                        .clipShape(Capsule())
+                                                }
+                                            }
+                                            Text("\(run.name) ・ \(relativeTime(run.createdAt)) ・ \(String(run.headSha.prefix(7)))")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        Image(systemName: "chevron.right")
+                                            .font(.caption)
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("ビルド状況")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        startWatch()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(token.isEmpty || parsedRepo == nil)
+                }
+            }
+        }
+    }
+
+    // MARK: - 表示ヘルパー
+
+    private func relativeTime(_ date: Date?) -> String {
+        guard let date else { return "時刻不明" }
+        let f = RelativeDateTimeFormatter()
+        f.locale = Locale(identifier: "ja_JP")
+        f.unitsStyle = .full
+        let rel = f.localizedString(for: date, relativeTo: Date())
+        let abs = date.formatted(date: .abbreviated, time: .shortened)
+        return "\(rel)（\(abs)）"
+    }
+
+    private func runIcon(_ run: RunInfo) -> (name: String, color: Color) {
+        if run.status != "completed" { return ("clock.fill", .orange) }
+        switch run.conclusion {
+        case "success": return ("checkmark.circle.fill", .green)
+        case "failure": return ("xmark.circle.fill", .red)
+        case "cancelled": return ("minus.circle.fill", .gray)
+        default: return ("exclamationmark.circle.fill", .gray)
+        }
+    }
+
+    private func runConclusionText(_ run: RunInfo) -> String {
+        if run.status != "completed" {
+            return run.status == "queued" ? "待機中" : "実行中"
+        }
+        switch run.conclusion {
+        case "success": return "成功"
+        case "failure": return "失敗"
+        case "cancelled": return "キャンセル"
+        default: return run.conclusion ?? "終了"
+        }
+    }
+
+    // MARK: - ZIP
 
     private func handlePickedURL(_ url: URL) {
         // asCopy=true でアプリ内にコピーされたファイルが渡ってくるので、そのまま読める
@@ -252,6 +446,8 @@ struct ContentView: View {
             files = []
         }
     }
+
+    // MARK: - GitHub操作
 
     private func testConnection() async {
         isBusy = true
@@ -318,8 +514,20 @@ struct ContentView: View {
                 progress: { done, total in
                     Task { @MainActor in progressText = "\(done)/\(total) ファイルを送信中…" }
                 })
-            status = "完了！コミット \(sha) で \(files.count) ファイルをアップロードしました。ビルドを監視します"
+            // 今回のコミットを記録（ビルド照合用・アプリを閉じても残る）
+            lastUploadRepo = repoText
+            lastUploadSha = sha
+            lastUploadAt = Date()
+            UserDefaults.standard.set(repoText, forKey: "gh.lastUploadRepo")
+            UserDefaults.standard.set(sha, forKey: "gh.lastUploadSha")
+            UserDefaults.standard.set(lastUploadAt, forKey: "gh.lastUploadAt")
+            runs = []
+            artifactList = []
+            artifactRunId = nil
+            ipaURL = nil
+            status = "完了！コミット \(sha) で \(files.count) ファイルをアップロードしました。「ビルド」タブで今回のビルドを監視します"
             isError = false
+            selectedTab = 1
             startWatch()
         } catch {
             status = error.localizedDescription
@@ -327,13 +535,13 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - ビルド監視
+
     private func startWatch() {
         guard parsedRepo != nil else { return }
         watchTask?.cancel()
-        artifactList = []
-        ipaURL = nil
-        runFailed = false
-        runStatus = "ビルド状況を取得中…"
+        watchFailed = false
+        watchStatus = "ビルド状況を取得中…"
         watchTask = Task { await pollRuns() }
     }
 
@@ -344,31 +552,48 @@ struct ContentView: View {
         for _ in 0..<40 {
             if Task.isCancelled { return }
             do {
-                guard let run = try await client.latestRun(owner: target.owner, repo: target.repo, branch: br) else {
-                    runStatus = "まだビルドが始まっていません"
-                    return
-                }
-                runURL = run.htmlURL
-                if run.status == "completed" {
-                    if run.conclusion == "success" {
-                        runStatus = "ビルド成功。成果物を取得できます"
-                        artifactList = (try? await client.listArtifacts(owner: target.owner, repo: target.repo, runId: run.id)) ?? []
-                        if artifactList.isEmpty { runStatus = "ビルド成功（成果物なし）" }
-                    } else {
-                        runStatus = "ビルド終了: \(run.conclusion ?? "不明")"
-                        runFailed = true
+                runs = try await client.listRuns(owner: target.owner, repo: target.repo, branch: br, perPage: 10)
+                if let m = matchedRun {
+                    if m.status == "completed" {
+                        if m.conclusion == "success" {
+                            watchStatus = "今回のビルドが成功しました（\(relativeTime(m.createdAt))開始）"
+                            watchFailed = false
+                            if artifactRunId != m.id {
+                                artifactList = (try? await client.listArtifacts(owner: target.owner, repo: target.repo, runId: m.id)) ?? []
+                                artifactRunId = m.id
+                                if artifactList.isEmpty { watchStatus = "今回のビルドは成功しましたが、成果物がありません" }
+                            }
+                        } else {
+                            watchStatus = "今回のビルドは終了しました: \(runConclusionText(m))"
+                            watchFailed = true
+                        }
+                        return
                     }
+                    watchStatus = "今回のビルドを実行中…（\(m.status)）自動で更新します"
+                } else if hasUploadContext {
+                    watchStatus = "今回のコミット（\(String(lastUploadSha.prefix(7)))）のビルド開始を待っています…（一覧にあるのは前回までのビルドです）"
+                } else if let latest = runs.first {
+                    if latest.status == "completed" {
+                        watchStatus = "最新のビルドは\(runConclusionText(latest))です（\(relativeTime(latest.createdAt))開始・今回のアップロードではありません）"
+                        if latest.conclusion == "success", artifactRunId != latest.id {
+                            artifactList = (try? await client.listArtifacts(owner: target.owner, repo: target.repo, runId: latest.id)) ?? []
+                            artifactRunId = latest.id
+                        }
+                        return
+                    }
+                    watchStatus = "最新のビルドを実行中…（\(latest.status)）"
+                } else {
+                    watchStatus = "このブランチのビルド履歴はまだありません"
                     return
                 }
-                runStatus = "ビルド中…（\(run.status)）自動で更新します"
             } catch {
-                runStatus = "状況の取得に失敗: \(error.localizedDescription)"
-                runFailed = true
+                watchStatus = "状況の取得に失敗: \(error.localizedDescription)"
+                watchFailed = true
                 return
             }
             try? await Task.sleep(nanoseconds: 15_000_000_000)
         }
-        runStatus = "監視を終了しました（まだ終わっていない場合は、もう一度確認してください）"
+        watchStatus = "監視を終了しました（まだ終わっていない場合は、もう一度確認してください）"
     }
 
     private func fetchArtifact(_ a: ArtifactInfo) async {

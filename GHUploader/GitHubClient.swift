@@ -100,11 +100,14 @@ struct GitHubClient {
 
 // MARK: - v2: リポジトリ作成 / Actions / 成果物
 
-struct RunInfo {
+struct RunInfo: Identifiable {
     let id: Int
+    let name: String
     let status: String        // queued / in_progress / completed
     let conclusion: String?   // success / failure / cancelled ...
     let htmlURL: String
+    let headSha: String       // この実行がビルドしたコミット（全SHA）
+    let createdAt: Date?
 }
 
 struct ArtifactInfo: Identifiable {
@@ -125,14 +128,26 @@ extension GitHubClient {
                 json["default_branch"] as? String ?? "main")
     }
 
-    func latestRun(owner: String, repo: String, branch: String) async throws -> RunInfo? {
+    /// 最近の実行一覧（新しい順）。head_sha と作成時刻つき。
+    /// 「今回アップロードしたコミットの実行」を特定するために使う。
+    func listRuns(owner: String, repo: String, branch: String, perPage: Int = 10) async throws -> [RunInfo] {
         let b = branch.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? branch
-        let json = try await request(method: "GET", path: "/repos/\(owner)/\(repo)/actions/runs?branch=\(b)&per_page=1")
-        guard let runs = json["workflow_runs"] as? [[String: Any]], let r = runs.first else { return nil }
-        return RunInfo(id: r["id"] as? Int ?? 0,
-                       status: r["status"] as? String ?? "",
-                       conclusion: r["conclusion"] as? String,
-                       htmlURL: r["html_url"] as? String ?? "")
+        let json = try await request(method: "GET", path: "/repos/\(owner)/\(repo)/actions/runs?branch=\(b)&per_page=\(perPage)")
+        let runs = json["workflow_runs"] as? [[String: Any]] ?? []
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime]
+        let fmtFrac = ISO8601DateFormatter()
+        fmtFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return runs.map { r in
+            let created = (r["created_at"] as? String).flatMap { fmt.date(from: $0) ?? fmtFrac.date(from: $0) }
+            return RunInfo(id: r["id"] as? Int ?? 0,
+                           name: r["name"] as? String ?? "workflow",
+                           status: r["status"] as? String ?? "",
+                           conclusion: r["conclusion"] as? String,
+                           htmlURL: r["html_url"] as? String ?? "",
+                           headSha: r["head_sha"] as? String ?? "",
+                           createdAt: created)
+        }
     }
 
     func listArtifacts(owner: String, repo: String, runId: Int) async throws -> [ArtifactInfo] {
